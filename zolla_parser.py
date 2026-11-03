@@ -111,8 +111,6 @@ def parse_product(data, url):
     current_price = read_price(normalized_text(prices[0])) if prices else None
     if current_price is None:
         current_price = read_price(details.get("price"))
-    if not name or not article or current_price is None:
-        raise ValueError("Не удалось прочитать название, артикул или текущую цену")
     old_nodes = product.xpath(
         './/*[contains(@class, "__aside-price-section")]'
         '//*[self::s or self::del or contains(@class, "__aside-price-old")]'
@@ -120,7 +118,7 @@ def parse_product(data, url):
     old_price = read_price(normalized_text(old_nodes[0])) if old_nodes else None
     if old_price is None:
         old_price = read_price(details.get("oldPrice"))
-    if old_price is None or old_price <= current_price:
+    if current_price is None or old_price is None or old_price <= current_price:
         old_price = ""
 
     sizes = [size.get("available") for size in details.get("sizes", [])]
@@ -135,6 +133,13 @@ def parse_product(data, url):
             out_of_stock = 1
         elif any(marker.endswith("/InStock") for marker in markers):
             out_of_stock = 0
+
+    if not name or not article:
+        raise ValueError("Не удалось прочитать название или артикул")
+    if current_price is None and not (
+        out_of_stock == 1 and "price" in details and details["price"] is None
+    ):
+        raise ValueError("Не удалось прочитать текущую цену")
 
     return {
         "hierarchy": " > ".join(hierarchy),
@@ -206,7 +211,7 @@ def main():
                         logging.error("%s — %s", url, error)
                         if isinstance(error, HTTPError) and error.code in {401, 403, 429}:
                             stopped = True
-                    if (saved + failed) % 100 == 0:
+                    if (saved + failed) % 100 == 0 and saved + failed != args.limit:
                         log_progress(started, saved, failed)
                 stream.flush()
     except KeyboardInterrupt:

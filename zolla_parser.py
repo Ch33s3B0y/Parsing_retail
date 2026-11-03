@@ -4,9 +4,12 @@ import argparse
 import csv
 import json
 import logging
+import math
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from itertools import islice
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -144,47 +147,77 @@ def parse_product(data, url):
     }
 
 
+def unique_products(urls):
+    seen = set()
+    for url in urls:
+        key = zolla_path(url).rstrip("/")
+        if key not in seen:
+            seen.add(key)
+            yield url
+
+
+def load_product(url, delay):
+    return parse_product(fetch(url, delay), url)
+
+
+def log_progress(started, saved, failed):
+    elapsed = time.perf_counter() - started
+    logging.info(
+        "Время: %.1f сек. | сохранено: %d | ошибок: %d | скорость: %.2f карточек/сек.",
+        elapsed, saved, failed, saved / elapsed if elapsed else 0,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("zolla.csv"))
     parser.add_argument("--limit", type=int, help="Максимум карточек для пробного запуска")
     parser.add_argument("--delay", type=float, default=0.5, help="Пауза перед каждым запросом, сек.")
+    parser.add_argument("--workers", type=int, default=1, help="Одновременные загрузки (от 1 до 8)")
     parser.add_argument("--url", action="append", help="Карточка Zolla. Можно передать несколько раз.")
     args = parser.parse_args()
-    if args.delay < 0 or (args.limit is not None and args.limit < 1):
-        parser.error("Требуется --delay >= 0 и --limit >= 1")
+    if not math.isfinite(args.delay) or args.delay < 0 or (args.limit is not None and args.limit < 1):
+        parser.error("Требуется конечный --delay >= 0 и --limit >= 1")
+    if not 1 <= args.workers <= 8:
+        parser.error("--workers должен быть от 1 до 8")
     if args.url and not all(map(is_product, args.url)):
         parser.error("--url должен указывать на карточку https://zolla.com/product/…")
 
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     partial = args.output.with_name(args.output.name + ".partial")
-    urls = args.url or discover_products(args.delay)
-    seen = set()
+    urls = islice(unique_products(args.url or discover_products(args.delay)), args.limit)
     saved = failed = 0
+    started = time.perf_counter()
+    logging.info("Загрузка карточек: потоков %d, пауза %.2f сек.", args.workers, args.delay)
+    pool = ThreadPoolExecutor(max_workers=args.workers)
     try:
         with partial.open("w", encoding="utf-8-sig", newline="") as stream:
             writer = csv.DictWriter(stream, fieldnames=FIELDS, delimiter=";")
             writer.writeheader()
-            for url in urls:
-                key = zolla_path(url).rstrip("/")
-                if key in seen:
-                    continue
-                seen.add(key)
-                try:
-                    writer.writerow(parse_product(fetch(url, args.delay), url))
-                    saved += 1
-                except (URLError, TimeoutError, ValueError) as error:
-                    failed += 1
-                    logging.error("%s — %s", url, error)
-                    if isinstance(error, HTTPError) and error.code in {401, 403, 429}:
-                        break
-                if len(seen) % 100 == 0:
-                    logging.info("Сохранено %d, ошибок %d", saved, failed)
-                if args.limit and len(seen) >= args.limit:
-                    break
+            stopped = False
+            while not stopped and (batch := list(islice(urls, args.workers))):
+                jobs = [pool.submit(load_product, url, args.delay) for url in batch]
+                for url, job in zip(batch, jobs):
+                    try:
+                        writer.writerow(job.result())
+                        saved += 1
+                    except (URLError, TimeoutError, ValueError) as error:
+                        failed += 1
+                        logging.error("%s — %s", url, error)
+                        if isinstance(error, HTTPError) and error.code in {401, 403, 429}:
+                            stopped = True
+                    if (saved + failed) % 100 == 0:
+                        log_progress(started, saved, failed)
+                stream.flush()
+    except KeyboardInterrupt:
+        logging.warning("Остановлено пользователем. Частичный результат: %s", partial)
+        return 130
     except (URLError, TimeoutError, ValueError, ElementTree.ParseError) as error:
         logging.error("Не удалось прочитать карту сайта: %s", error)
         failed += 1
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+        log_progress(started, saved, failed)
     if failed or not saved:
         logging.error("Сохранено %d, ошибок %d. Частичный результат: %s", saved, failed, partial)
         return 1
